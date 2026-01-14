@@ -19,6 +19,16 @@ class RedshiftService(DatabaseService):
         self.iam_role = parameters['iam_redshift_s3_read']
         self.db_connection: RedshiftConnection = self.get_connection()
 
+    def get_last_copy_count(self) -> int:
+        """
+        Returns the number of rows loaded by the last COPY command.
+        """
+        query = "select pg_last_copy_count();"
+        result = self.db_connection.execute_query(query)
+        if result:
+            return int(result[0][0])
+        return 0
+
     def get_connection(self) -> RedshiftConnection:
         return RedshiftConnection(
             database=self.database,
@@ -163,6 +173,40 @@ class RedshiftService(DatabaseService):
                 CREATE TABLE IF NOT EXISTS {self.schema}.{table_name} ({sql_string})
             """)
 
+    def create_processed_files_log_table(self):
+        """
+        Creates the table to track processed files for strict idempotency.
+        """
+        query = f"""
+            CREATE TABLE IF NOT EXISTS {self.schema}.processed_files_log (
+                filename VARCHAR(255) PRIMARY KEY,
+                process_date TIMESTAMPTZ DEFAULT SYSDATE,
+                status VARCHAR(50)
+            );
+        """
+        self.db_connection.execute_query(query)
+
+    def check_file_processed(self, filename: str) -> bool:
+        """
+        Checks if a file has already been processed.
+        """
+        query = f"""
+            SELECT exists (SELECT 1 FROM {self.schema}.processed_files_log WHERE filename = '{filename}')
+        """
+        result = self.db_connection.execute_query(query)
+        if result and result[0][0]:
+             return True
+        return False
+
+    def log_file_processed(self, filename: str, status: str = 'SUCCESS'):
+        """
+        Logs a file as processed.
+        """
+        query = f"""
+            INSERT INTO {self.schema}.processed_files_log (filename, status) VALUES ('{filename}', '{status}');
+        """
+        self.db_connection.execute_query(query)
+
     def add_columns_to_table(self, columns_to_add: pd.DataFrame, table_name: str):
         column_definitions: str = self.create_sql_str_column_definitions(
             table_df=columns_to_add, is_picklist=False,
@@ -205,7 +249,7 @@ class RedshiftService(DatabaseService):
             self.process_delete(row=row,
                                 starting_directory=starting_directory)
 
-    def create_staging_table(self, staging_table_name: str, **kwargs):
+    def create_staging_table(self, staging_table_name: str, expected_row_count: int = None, **kwargs):
         formatted_headers = ", ".join(kwargs['csv_headers'])
 
         create_staging_table_query: str = f"""
@@ -222,6 +266,11 @@ class RedshiftService(DatabaseService):
                         TRUNCATECOLUMNS;
                     """
         self.db_connection.execute_query(create_staging_table_query)
+
+        if expected_row_count is not None:
+            actual = self.get_last_copy_count()
+            if actual != expected_row_count:
+                raise Exception(f"Data Assurance Failure: Expected {expected_row_count} rows, loaded {actual} rows for table {kwargs.get('table_name')}")
 
     def delete_duplicate_rows_from_table(self, table_name: str, staging_table_name: str, pk_condition: str):
         delete_duplicates_query = f"""
@@ -272,13 +321,19 @@ class RedshiftService(DatabaseService):
 
             self.db_connection.execute_query(copy_query)
 
+            expected_rows = int(row.get('records', 0))
+            if expected_rows > 0:
+                actual = self.get_last_copy_count()
+                if actual != expected_rows:
+                     raise Exception(f"Data Assurance Failure (DELETE): Expected {expected_rows} rows, loaded {actual} rows for table {table_name}")
+
             # Delete the matching rows from the target table
             delete_query = (f"DELETE FROM {self.database}.{self.schema}.{table_name} "
                             f"WHERE {column_names} IN (SELECT {column_names} FROM temp_{table_name}_deletes);")
 
             self.db_connection.execute_query(delete_query)
 
-    def load_full_or_log_data(self, table_name: str, object_path: str, headers: list = None):
+    def load_full_or_log_data(self, table_name: str, object_path: str, headers: list = None, expected_row_count: int = None):
         final_headers_for_query: str = ''
 
         if headers:
@@ -305,8 +360,13 @@ class RedshiftService(DatabaseService):
                 FILLRECORD 
                 TRUNCATECOLUMNS;
             """)
+        
+        if expected_row_count is not None:
+            actual = self.get_last_copy_count()
+            if actual != expected_row_count:
+                raise Exception(f"Data Assurance Failure: Expected {expected_row_count} rows, loaded {actual} rows for table {table_name}")
 
-    def load_incremental_data(self, table_name: str, object_path: str, headers: str = None):
+    def load_incremental_data(self, table_name: str, object_path: str, headers: str = None, expected_row_count: int = None):
         if table_name == 'metadata':
             primary_keys = ["extract", "column_name"]
         elif table_name == 'picklist__sys':
@@ -322,7 +382,8 @@ class RedshiftService(DatabaseService):
         self.create_staging_table(staging_table_name=staging_table_name,
                                   table_name=table_name,
                                   object_path=object_path,
-                                  csv_headers=headers)
+                                  csv_headers=headers,
+                                  expected_row_count=expected_row_count)
 
         self.delete_duplicate_rows_from_table(table_name=table_name,
                                               staging_table_name=staging_table_name,

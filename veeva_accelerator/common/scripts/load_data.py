@@ -152,14 +152,16 @@ def process_manifest_row(database_service: DatabaseService,
                               object_storage_service=object_storage_service,
                               extract_type=extract_type,
                               table_name=table_name,
-                              filename=filename)
+                              filename=filename,
+                              expected_row_count=int(row.get('records', 0)))
 
 
 def load_data_into_tables(database_service: DatabaseService,
                           object_storage_service: ObjectStorageService,
                           extract_type: str,
                           table_name: str,
-                          filename: str):
+                     filename: str,
+                     expected_row_count: int = None):
     full_object_path: str = object_storage_service.get_full_object_path(filename=filename)
     relative_object_path: str = object_storage_service.get_relative_object_path(filename=filename)
     headers: list[str] | None = None
@@ -171,11 +173,13 @@ def load_data_into_tables(database_service: DatabaseService,
     if extract_type in ["full", "log"]:
         database_service.load_full_or_log_data(table_name=table_name,
                                                object_path=full_object_path,
-                                               headers=headers)
+                                               headers=headers,
+                                               expected_row_count=expected_row_count)
     if extract_type == "incremental":
         database_service.load_incremental_data(table_name=table_name,
                                                object_path=full_object_path,
-                                               headers=headers)
+                                               headers=headers,
+                                               expected_row_count=expected_row_count)
 
 # Thread-Safe Worker logic for Grouped Table (Delete + Update)
 def process_table_group_safe(redshift_params: dict,
@@ -195,14 +199,24 @@ def process_table_group_safe(redshift_params: dict,
         
         # 1. Process Deletes (if any) - MUST happen before updates
         if delete_row is not None:
-            local_service.process_delete(row=delete_row, starting_directory=starting_directory)
+            if local_service.check_file_processed(delete_row['file']):
+                log_message("Info", f"Skipping DELETE for {delete_row['file']} (Already Processed)")
+                delete_row = None
+            else:
+                local_service.process_delete(row=delete_row, starting_directory=starting_directory)
+                local_service.log_file_processed(delete_row['file'])
 
         # 2. Process Updates (if any)
         if update_row is not None:
-            process_manifest_row(database_service=local_service,
-                                 object_storage_service=object_storage_service,
-                                 row=update_row,
-                                 extract_type=extract_type)
+            if local_service.check_file_processed(update_row['file']):
+                log_message("Info", f"Skipping UPDATE for {update_row['file']} (Already Processed)")
+                update_row = None
+            else:
+                process_manifest_row(database_service=local_service,
+                                     object_storage_service=object_storage_service,
+                                     row=update_row,
+                                     extract_type=extract_type)
+                local_service.log_file_processed(update_row['file'])
         
         return local_service
     except Exception as e:
@@ -225,7 +239,9 @@ def run(object_storage_service: ObjectStorageService,
         extract_type: str = direct_data_params['extract_type']
 
         database_service.db_connection.activate_cursor()
+        database_service.db_connection.activate_cursor()
         database_service.check_if_schema_exists()
+        database_service.create_processed_files_log_table()
 
         file_extension: str = '.csv'
         if database_service.convert_to_parquet:

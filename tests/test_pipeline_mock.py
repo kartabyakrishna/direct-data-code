@@ -31,6 +31,10 @@ class TestLoadDataExtensive(unittest.TestCase):
         self.redshift_params = {'host': 'mock_host', 'user': 'mock_user'}
         self.direct_data_params = {'extract_type': 'incremental'}
 
+        # Default behavior for service instances created by Class Mock
+        # We need to patch the Class, but configure the instances it produces.
+        # This is done inside tests usually, but we can set defaults here if we verify logic.
+
     @patch('veeva_accelerator.common.scripts.load_data.RedshiftService')
     @patch('veeva_accelerator.common.scripts.load_data.convert_file_to_table')
     @patch('veeva_accelerator.common.scripts.load_data.handle_metadata_changes')
@@ -48,6 +52,10 @@ class TestLoadDataExtensive(unittest.TestCase):
             "records": [100] * 20
         }
         mock_convert.return_value = pd.DataFrame(data)
+        
+        # Configure Mock
+        MockRedshiftService.return_value.check_file_processed.return_value = False
+        MockRedshiftService.return_value.get_last_copy_count.return_value = 100
         
         # Instantiate
         load_data.run(self.mock_s3, self.mock_db, self.direct_data_params, self.redshift_params)
@@ -84,6 +92,9 @@ class TestLoadDataExtensive(unittest.TestCase):
 
         # Setup 5 distinct mock services required for tracking
         mock_services = [MagicMock(name=f"Service_{i}") for i in range(5)]
+        for svc in mock_services:
+            svc.check_file_processed.return_value = False
+            svc.get_last_copy_count.return_value = 100
         
         # Configure Service 3 (index 2) to FAIL during processing
         # We fail at 'load_incremental_data' which is called inside process_manifest_row
@@ -154,14 +165,18 @@ class TestLoadDataExtensive(unittest.TestCase):
             "file": ["A_del.csv", "B_upd.csv", "C_del.csv", "C_upd.csv"],
             "extract": ["v.A_deletes", "v.B", "v.C_deletes", "v.C"],
             "type": ["deletes", "updates", "deletes", "updates"],
-            "records": [10, 10, 10, 10]
+            "records": [100, 100, 100, 100]
         }
         mock_convert.return_value = pd.DataFrame(data)
         
         # 3 Groups: A (Del), B (Upd), C (Both)
-        mock_A = MagicMock(name="Service_A")
+        mock_A = MagicMock(name="Service_A") 
         mock_B = MagicMock(name="Service_B")
         mock_C = MagicMock(name="Service_C")
+
+        for svc in [mock_A, mock_B, mock_C]:
+            svc.check_file_processed.return_value = False
+            svc.get_last_copy_count.return_value = 100
         
         # We need to map instantiation to these mocks based on... random thread execution?
         # We can just verify that *SOME* service called process_delete('A'), 
@@ -221,10 +236,16 @@ class TestLoadDataExtensive(unittest.TestCase):
             "file": ["active.csv", "empty.csv", "ignored.csv"],
             "extract": ["v.active", "v.empty", "v.ignored"],
             "type": ["updates", "updates", "updates"],
+            "type": ["updates", "updates", "updates"],
             "records": [100, 0, 0] 
         }
         mock_convert.return_value = pd.DataFrame(data)
         
+        # Configure Mock Instance
+        mock_instance = MockRedshiftService.return_value
+        mock_instance.check_file_processed.return_value = False
+        mock_instance.get_last_copy_count.return_value = 100
+
         # Instantiate service (should be instantiated ONLY for the active table ideally, 
         # or instantiated but no work done)
         # Our logic groups by manifest rows where records > 0 for updates (line 159 approx in verification view)
