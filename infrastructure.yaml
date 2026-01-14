@@ -1,0 +1,209 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Veeva Direct Data to Redshift Pipeline - Production Infrastructure'
+
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, test, prod]
+  
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC ID where Redshift resides (required for Glue connectivity)
+  
+  SubnetId:
+    Type: AWS::EC2::Subnet::Id
+    Description: Private Subnet ID for Glue Job (must have route to Redshift and S3 via endpoints/NAT)
+    
+  RedshiftSecurityGroupId:
+    Type: AWS::EC2::SecurityGroup::Id
+    Description: Security Group ID of the Redshift Cluster
+
+  RedshiftSecretArn:
+    Type: String
+    Description: ARN of the Secrets Manager secret containing Redshift credentials
+
+  SourceBucketName:
+    Type: String
+    Description: Name of the existing specific bucket where manual artifacts are stored (if any) or new bucket name prefix
+
+Resources:
+  # --- 1. Storage ---
+  VeevaLandingBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+  
+  VeevaStateTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "VeevaStateTable-${Environment}"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: process_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: process_id
+          KeyType: HASH
+
+  # --- 2. Networking ---
+  GlueSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security Group for Veeva Glue Job
+      VpcId: !Ref VpcId
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 5439
+          ToPort: 5439
+          DestinationSecurityGroupId: !Ref RedshiftSecurityGroupId
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: Allow outbound HTTPS to AWS Services (S3, SSM, etc)
+
+  # --- 3. Notification ---
+  VeevaAlertTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "Veeva-Pipeline-Alerts-${Environment}"
+  
+  # --- 4. IAM Role ---
+  VeevaGlueRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: glue.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole
+      Policies:
+        - PolicyName: VeevaAccessPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:ListBucket
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                Resource:
+                  - !GetAtt VeevaLandingBucket.Arn
+                  - !Sub "${VeevaLandingBucket.Arn}/*"
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                Resource: !GetAtt VeevaStateTable.Arn
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !GetAtt VeevaAlertTopic.TopicArn
+              - Effect: Allow
+                Action:
+                  - events:DisableRule
+                  - events:EnableRule
+                Resource: !Sub "arn:aws:events:${AWS::Region}:${AWS::AccountId}:rule/Veeva-Redshift-Schedule-${Environment}"
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource: !Ref RedshiftSecretArn
+
+  # --- 5. Compute (Glue Job) ---
+  VeevaGlueJob:
+    Type: AWS::Glue::Job
+    Properties:
+      Name: !Sub "VeevaRedshiftConnector-${Environment}"
+      Role: !GetAtt VeevaGlueRole.Arn
+      Command:
+        Name: pythonshell
+        PythonVersion: "3.9"
+        ScriptLocation: !Sub "s3://${VeevaLandingBucket}/scripts/pipeline_main.py"
+      MaxCapacity: 1.0 # 1 DPU (standard for Python Shell)
+      GlueVersion: "3.0"
+      Connections:
+        Connections:
+          - !Ref GlueConnection
+      DefaultArguments:
+        "--additional-python-modules": "pandas,psycopg2-binary,pyarrow"
+        "--extra-py-files": !Sub "s3://${VeevaLandingBucket}/scripts/veeva_accelerator.zip"
+        "--DYNAMODB_STATE_TABLE": !Ref VeevaStateTable
+        "--SNS_TOPIC_ARN": !Ref VeevaAlertTopic
+        "--PROCESS_ID": "VeevaRedshift_Incremental"
+        "--CONNECTOR_CONFIG_PATH": "/app/config/connector_config.json"
+        
+  GlueConnection:
+    Type: AWS::Glue::Connection
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      ConnectionInput:
+        Name: !Sub "VeevaRedshiftNetwork-${Environment}"
+        ConnectionType: NETWORK
+        PhysicalConnectionRequirements:
+          SubnetId: !Ref SubnetId
+          SecurityGroupIdList:
+            - !Ref GlueSecurityGroup
+
+  # --- 6. Scheduling ---
+  # --- 6. Scheduling ---
+  VeevaIncrementalSchedule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub "Veeva-Redshift-Incremental-${Environment}"
+      Description: Triggers Veeva Incremental Load every 15 minutes
+      ScheduleExpression: "rate(15 minutes)"
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt VeevaGlueJob.Arn
+          Id: "GlueJobTarget-Incremental"
+          RoleArn: !GetAtt EventBridgeInvocationRole.Arn
+          Input: !Sub '{"--DIRECT_DATA_EXTRACT_TYPE": "incremental", "--EVENT_RULE_NAME": "Veeva-Redshift-Incremental-${Environment}"}'
+
+  VeevaLogSchedule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub "Veeva-Redshift-Log-${Environment}"
+      Description: Triggers Veeva System Log Load Daily at Midnight UTC
+      ScheduleExpression: "cron(0 0 * * ? *)"
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt VeevaGlueJob.Arn
+          Id: "GlueJobTarget-Log"
+          RoleArn: !GetAtt EventBridgeInvocationRole.Arn
+          Input: !Sub '{"--DIRECT_DATA_EXTRACT_TYPE": "log", "--EVENT_RULE_NAME": "Veeva-Redshift-Log-${Environment}"}'
+
+  EventBridgeInvocationRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: InvokeGlue
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: glue:StartJobRun
+                Resource: !GetAtt VeevaGlueJob.Arn
+
+Outputs:
+  BucketName:
+    Value: !Ref VeevaLandingBucket
+  DynamoTableName:
+    Value: !Ref VeevaStateTable
+  TopicArn:
+    Value: !Ref VeevaAlertTopic
+  GlueJobName:
+    Value: !Ref VeevaGlueJob
