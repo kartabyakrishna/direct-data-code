@@ -1,0 +1,142 @@
+name: Deploy Veeva Redshift Pipeline
+
+on:
+  push:
+    branches: [ "main", "develop" ]
+  pull_request:
+    branches: [ "main", "develop" ]
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: ${{ secrets.AWS_REGION }}
+
+jobs:
+  integration:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Set up Python 3.9
+        uses: actions/setup-python@v4
+        with:
+          python-version: "3.9"
+
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pandas pyarrow cfn-lint boto3 psycopg2-binary
+          pip install -r requirements.txt || true
+
+      - name: Lint CloudFormation
+        run: |
+          cfn-lint infrastructure.yaml --ignore-checks E1010
+
+      - name: Run Schema & Logic Tests
+        run: |
+          python tests/test_pipeline_mock.py
+
+  deploy:
+    needs: integration
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    environment: ${{ github.ref == 'refs/heads/main' && 'prod' || 'dev' }}
+    
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Package Code
+        run: |
+          # Create zip for glue job, excluding junk
+          zip -r veeva_accelerator.zip veeva_accelerator/ -x "*__pycache__*" "*.pyc"
+
+      - name: Upload Artifacts to S3
+        run: |
+          aws s3 cp veeva_accelerator.zip s3://${{ secrets.VEEVA_LANDING_BUCKET }}/scripts/
+          aws s3 cp pipeline_main.py s3://${{ secrets.VEEVA_LANDING_BUCKET }}/scripts/
+
+      - name: Deploy CloudFormation Stack
+        run: |
+          ENV_NAME="dev"
+          if [[ "${{ github.ref }}" == "refs/heads/main" ]]; then
+            ENV_NAME="prod"
+          fi
+          
+          echo "Deploying to Environment: $ENV_NAME"
+          
+          aws cloudformation deploy \
+            --template-file infrastructure.yaml \
+            --stack-name VeevaRedshiftPipeline-$ENV_NAME \
+            --capabilities CAPABILITY_NAMED_IAM \
+            --parameter-overrides \
+              Environment=$ENV_NAME \
+              VpcId=${{ secrets.VPC_ID }} \
+              SubnetId=${{ secrets.SUBNET_ID }} \
+              RedshiftSecurityGroupId=${{ secrets.REDSHIFT_SG_ID }} \
+              SourceBucketName=${{ secrets.VEEVA_LANDING_BUCKET }} \
+              
+      - name: Update Configuration Secret
+        run: |
+          ENV_NAME="dev"
+          if [[ "${{ github.ref }}" == "refs/heads/main" ]]; then
+            ENV_NAME="prod"
+          fi
+          
+          # Construct JSON Payload from Secrets
+          # We use jq to create a robust JSON string
+          
+          # 1. Direct Data Config
+          DIRECT_DATA_JSON=$(jq -n \
+            --arg start "${{ secrets.DIRECT_DATA_START }}" \
+            --arg stop "${{ secrets.DIRECT_DATA_STOP }}" \
+            '{start_time: $start, stop_time: $stop, extract_type: "incremental"}')
+            
+          # 2. S3 Config
+          S3_JSON=$(jq -n \
+            --arg bucket "${{ secrets.VEEVA_LANDING_BUCKET }}" \
+            --arg role "${{ secrets.DIRECT_DATA_ROLE_ARN }}" \
+            '{bucket_name: $bucket, iam_role_arn: $role, direct_data_folder: "direct-data", extract_folder: "extracts"}')
+            
+          # 3. Redshift Config
+          REDSHIFT_JSON=$(jq -n \
+            --arg host "${{ secrets.REDSHIFT_HOST }}" \
+            --arg user "${{ secrets.REDSHIFT_USER }}" \
+            --arg pass "${{ secrets.REDSHIFT_PASSWORD }}" \
+            --arg db "${{ secrets.REDSHIFT_DB }}" \
+            --arg role "${{ secrets.REDSHIFT_S3_IAM_ROLE }}" \
+            '{host: $host, port: "5439", user: $user, password: $pass, database: $db, schema: "public", iam_redshift_s3_read: $role}')
+            
+          # 4. VAPIL (Vault) Config
+          VAPIL_JSON=$(jq -n \
+            --arg user "${{ secrets.VAULT_USERNAME }}" \
+            --arg pass "${{ secrets.VAULT_PASSWORD }}" \
+            --arg dns "${{ secrets.VAULT_DNS }}" \
+            --arg client "${{ secrets.VAULT_CLIENT_ID }}" \
+            '{authenticationType: "BASIC", vaultUsername: $user, vaultPassword: $pass, vaultDNS: $dns, vaultClientId: $client, logApiErrors: true, validateSession: true}')
+            
+          # MERGE ALL
+          FULL_JSON=$(jq -n \
+            --argjson dd "$DIRECT_DATA_JSON" \
+            --argjson s3 "$S3_JSON" \
+            --argjson rs "$REDSHIFT_JSON" \
+            --argjson va "$VAPIL_JSON" \
+            '{connector_config: {direct_data: $dd, s3: $s3, redshift: $rs}, vapil_settings: $va}')
+            
+          # Update Secret in AWS
+          SECRET_NAME="VeevaRedshiftConfig-$ENV_NAME"
+          echo "Updating Secret: $SECRET_NAME"
+          
+          aws secretsmanager put-secret-value \
+            --secret-id $SECRET_NAME \
+            --secret-string "$FULL_JSON"
+

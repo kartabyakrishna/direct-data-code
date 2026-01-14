@@ -1,13 +1,14 @@
 import boto3
 import json
+import os
 from botocore.exceptions import ClientError
 from common.utilities import log_message
 
 class FailureHandler:
-    def __init__(self, sns_topic_arn: str, eventbridge_rule_name: str, region_name: str = 'us-east-1'):
+    def __init__(self, sns_topic_arn: str, eventbridge_rule_name: str, region_name: str = None):
         self.sns_topic_arn = sns_topic_arn
         self.eventbridge_rule_name = eventbridge_rule_name
-        self.region_name = region_name
+        self.region_name = region_name or os.environ.get('AWS_REGION')
         self.sns = boto3.client('sns', region_name=self.region_name)
         self.events = boto3.client('events', region_name=self.region_name)
 

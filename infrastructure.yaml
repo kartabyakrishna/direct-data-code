@@ -19,19 +19,24 @@ Parameters:
     Type: AWS::EC2::SecurityGroup::Id
     Description: Security Group ID of the Redshift Cluster
 
-  RedshiftSecretArn:
-    Type: String
-    Description: ARN of the Secrets Manager secret containing Redshift credentials
+
 
   SourceBucketName:
     Type: String
     Description: Name of the existing specific bucket where manual artifacts are stored (if any) or new bucket name prefix
 
 Resources:
-  # --- 1. Storage ---
+  # --- 1. Secrets ---
+  VeevaConfigurationSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub "VeevaRedshiftConfig-${Environment}"
+      Description: "Configuration for Veeva Redshift Pipeline (Connector & VAPIL)"
+      SecretString: '{"placeholder": "value_will_be_updated_by_deployment_pipeline"}'
   VeevaLandingBucket:
     Type: AWS::S3::Bucket
     Properties:
+      BucketName: !Ref SourceBucketName
       BucketEncryption:
         ServerSideEncryptionConfiguration:
           - ServerSideEncryptionByDefault:
@@ -114,7 +119,7 @@ Resources:
               - Effect: Allow
                 Action:
                   - secretsmanager:GetSecretValue
-                Resource: !Ref RedshiftSecretArn
+                Resource: !Ref VeevaConfigurationSecret
 
   # --- 5. Compute (Glue Job) ---
   VeevaGlueJob:

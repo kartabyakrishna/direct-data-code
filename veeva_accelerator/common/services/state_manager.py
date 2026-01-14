@@ -4,9 +4,9 @@ from botocore.exceptions import ClientError
 from common.utilities import log_message
 
 class StateManager:
-    def __init__(self, parameter_name: str, region_name: str = 'us-east-1'):
+    def __init__(self, parameter_name: str, region_name: str = None):
         self.parameter_name = parameter_name
-        self.region_name = region_name
+        self.region_name = region_name or os.environ.get('AWS_REGION')
         # Initialize SSM client
         # In AWS Batch (Fargate), credentials are auto-handled by the task role
         self.ssm = boto3.client('ssm', region_name=self.region_name)
@@ -40,17 +40,15 @@ class StateManager:
                 Value=timestamp,
                 Type='String',
                 Overwrite=True
-                Type='String',
-                Overwrite=True
             )
         except ClientError as e:
             log_message('Error', f"Failed to update parameter {self.parameter_name}", exception=e)
             raise e
 
 class DynamoDBStateManager:
-    def __init__(self, table_name: str, region_name: str = 'us-east-1'):
+    def __init__(self, table_name: str, region_name: str = None):
         self.table_name = table_name
-        self.region_name = region_name
+        self.region_name = region_name or os.environ.get('AWS_REGION')
         self.dynamodb = boto3.resource('dynamodb', region_name=self.region_name)
         self.table = self.dynamodb.Table(self.table_name)
 
