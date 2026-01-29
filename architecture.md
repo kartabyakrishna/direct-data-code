@@ -1,397 +1,587 @@
+Veeva Direct Data API → Amazon Redshift
 
-
-Final Design: Veeva Direct Data API → Amazon Redshift
-
-(Robust, Sequential, Transactional, Event-Driven)
-
-
----
-
-1. Design Objectives (Non-negotiable)
-
-1. Exactly-once apply semantics per DDAPI incremental window (stoptime)
-
-
-2. Strict ordering of incremental windows
-
-
-3. One 15-minute window = one Redshift transaction
-
-
-4. No full reloads on failure
-
-
-5. Automatic pause & resume on failures
-
-
-6. Event-driven recovery (no waiting for schedulers)
-
-
-7. Only one Glue job running at a time
-
-
-8. Producer failures must not block ingestion
-
-
-9. Apply failures must block downstream apply
-
-
-10. Operationally simple for support teams
-
-
+Final Architecture & Workflow (Incremental, Log, Full Load)
 
 
 ---
 
-2. High-Level Architecture
+1. Purpose & Scope
 
-┌─────────────────────────┐
-                   │        EventBridge       │
-                   │   (every 15 min + lag)   │
-                   └───────────┬─────────────┘
-                               ↓
-                 ┌─────────────────────────────┐
-                 │  Producer Job (ECS / Glue)  │
-                 │  - Call DDAPI               │
-                 │  - Download tar.gz          │
-                 │  - Extract CSVs             │
-                 │  - Validate & checksum      │
-                 └───────────┬─────────────────┘
-                             ↓
-          ┌────────────────────────────────────────┐
-          │                 Amazon S3               │
-          │  raw-ddapi/vault=X/stoptime=YYYYMMDDHHMM│
-          │   - manifest.csv                        │
-          │   - object_upsert.csv                   │
-          │   - object_delete.csv                   │
-          └───────────┬────────────────────────────┘
-                      ↓
-          ┌────────────────────────────────────────┐
-          │              DynamoDB Queue             │
-          │  (ordered by vault_id + stoptime)      │
-          │  status: READY | PROCESSING | FAILED    │
-          │          | APPLIED                      │
-          └───────────┬────────────────────────────┘
-                      ↓   (Streams)
-          ┌────────────────────────────────────────┐
-          │           DynamoDB Stream               │
-          └───────────┬────────────────────────────┘
-                      ↓
-          ┌────────────────────────────────────────┐
-          │          Lambda (Waker)                 │
-          │  - If no PROCESSING item exists        │
-          │  - Trigger Step Function               │
-          └───────────┬────────────────────────────┘
-                      ↓
-          ┌────────────────────────────────────────┐
-          │        Step Functions (Consumer)        │
-          │  - Claim next window                   │
-          │  - Run Glue Apply Job                  │
-          │  - Loop until blocked or empty         │
-          └───────────┬────────────────────────────┘
-                      ↓
-          ┌────────────────────────────────────────┐
-          │             Glue Apply Job              │
-          │  - COPY into Redshift staging schema    │
-          │  - MERGE into final tables              │
-          │  - One transaction per stoptime         │
-          └────────────────────────────────────────┘
+This document describes the final, production‑grade architecture for ingesting data from Veeva Direct Data API (DDAPI) into Amazon Redshift, supporting:
+
+15‑minute incremental data loads
+
+Daily log loads
+
+Catastrophic full load recovery
+
+
+The design guarantees:
+
+Exactly‑once apply semantics
+
+Strict ordering of incrementals
+
+Transactional safety
+
+Automatic pause and resume
+
+Event‑driven execution (no polling delays)
+
+No unnecessary full reloads
+
+
+This document incorporates all scenarios, edge cases, and control‑plane rules discussed so far.
 
 
 ---
 
-3. Producer Path (Time-Driven, Non-Blocking)
+2. Core Design Principles (Non‑Negotiable)
+
+1. One DDAPI window = one Redshift transaction
+
+
+2. Incrementals must be applied strictly in stoptime order
+
+
+3. Only Redshift COMMIT advances data truth
+
+
+4. S3 is durable storage, not transactional state
+
+
+5. DynamoDB is the single source of control‑plane truth
+
+
+6. Producer must never block
+
+
+7. Apply failures must block downstream apply
+
+
+8. FULL load resets truth and rewinds incrementals
+
+
+9. Control‑plane state is authoritative, not file arrival time
+
+
+
+
+---
+
+3. High‑Level Architecture
+
+Separation of Concerns
+
+Layer	Responsibility
+
+Producer	Retrieve & extract DDAPI files
+Storage	Durable landing of extracted files
+Control Plane	Ordering, locking, precedence, recovery
+Consumer	Transactional apply into Redshift
+
+
+
+---
+
+4. AWS Services Used
+
+Concern	Service
+
+Scheduling (producer)	EventBridge
+DDAPI retrieval	ECS Fargate or Glue Batch
+Durable storage	Amazon S3
+Control plane	DynamoDB
+Event‑driven wakeup	DynamoDB Streams + Lambda
+Orchestration	Step Functions
+Transform / Apply	AWS Glue
+Data warehouse	Amazon Redshift
+Alerting	SNS / PagerDuty / Slack
+
+
+
+---
+
+5. Data Types Supported
+
+5.1 Incremental Data (15‑minute)
+
+Generated every 15 minutes
+
+Contains:
+
+Manifest file (rows describe object, operation, file path)
+
+Upsert CSVs
+
+Delete CSVs
+
+
+
+5.2 Log Data (Daily)
+
+Generated once per day
+
+Incremental in nature
+
+Independent of fact tables
+
+Lower precedence than incrementals
+
+
+5.3 Full Load (Catastrophic Recovery)
+
+Generated once per day
+
+Snapshot valid only as of 00:00 UTC
+
+Replaces all existing warehouse data
+
+
+
+---
+
+6. S3 Layout (Raw Zone)
+
+s3://ddapi-raw/
+  vault=X/
+    incr/stoptime=YYYYMMDDHHMM/
+      manifest.csv
+      objectA_upsert.csv
+      objectA_delete.csv
+    log/date=YYYYMMDD/
+      log_manifest.csv
+      log_data.csv
+    full/date=YYYYMMDD/
+      full_manifest.csv
+      full_data.csv
+
+
+---
+
+7. DynamoDB Control Plane
+
+7.1 Queue Table: ddapi_queue
+
+Attribute	Description
+
+vault_id (PK)	Vault identifier
+sort_key (SK)	stoptime / logical time
+load_type	INCR / LOG / FULL
+status	READY / PROCESSING / FAILED / APPLIED
+s3_prefix	Input data location
+checksum	Manifest checksum
+attempt_count	Retry tracking
+last_error	Failure reason
+
+
+Ordering is enforced by sort_key.
+
+
+---
+
+7.2 Vault State Table: ddapi_vault_state
+
+Attribute	Description
+
+vault_id (PK)	Vault
+mode	INCREMENTAL / FULL_LOAD
+last_applied_stoptime	Logical watermark
+current_epoch	Generation counter
+full_load_started_at	Audit
+
+
+
+---
+
+8. Producer Workflow (Incremental & Log)
 
 Trigger
 
-EventBridge every 15 minutes (with a small delay, e.g. +3–5 min)
+EventBridge (every 15 minutes for INCR, daily for LOG)
 
 
-Responsibilities
+Steps
 
-1. Call Veeva DDAPI incremental endpoint
+1. Call DDAPI endpoint
 
 
-2. Download .tar.gz
+2. Download tar.gz
 
 
 3. Extract all files
 
 
-4. Write extracted files to S3:
-
-s3://raw-ddapi/vault=X/stoptime=T/
-  - manifest.csv
-  - <object>_upsert.csv
-  - <object>_delete.csv
+4. Validate completeness
 
 
-5. Compute checksum of manifest
+5. Write extracted CSVs to S3
 
 
-6. Insert DynamoDB record:
+6. Compute checksum
+
+
+7. Insert queue entry:
 
 
 
-PK: vault_id
-SK: stoptime
 status = READY
-s3_prefix
-checksum
-attempt_count = 0
+load_type = INCR | LOG
 
-Failure handling
+Failure Handling
 
-Retrieval / extract failure → no DynamoDB entry
+Retrieval or extract failure:
+
+No queue entry created
 
 No downstream impact
 
-Next scheduled run retries
-
-
-> Producer never blocks because of Redshift or apply failures.
-
 
 
 
 ---
 
-4. DynamoDB Queue (Single Source of Truth)
+9. Consumer Wakeup Mechanism
 
-Table: ddapi_queue
+DynamoDB Streams enabled on ddapi_queue
 
-Attribute	Purpose
+Stream triggers Lambda ("waker")
 
-vault_id (PK)	Partition
-stoptime (SK)	Ordering
-status	READY / PROCESSING / FAILED / APPLIED
-s3_prefix	Input data location
-checksum	Integrity
-attempt_count	Retry tracking
-last_error	Diagnostics
+Lambda checks:
+
+No window in PROCESSING
 
 
-Ordering Rule
-
-> Windows must be applied strictly in ascending stoptime order.
+If eligible → start Step Function execution
 
 
+This ensures immediate resume after unblock, no polling.
 
 
 ---
 
-5. Consumer Path (Event-Driven, Serialized)
+10. Consumer Selection Logic (Critical)
 
-Trigger
+General Rule
 
-DynamoDB Streams → Lambda → Step Functions
-
-
-Lambda “Waker” Logic
-
-1. Triggered on:
-
-New item with status = READY
-
-Update from FAILED → READY
-
-Update from PROCESSING → APPLIED
+> Consumer always inspects the earliest non‑APPLIED window.
 
 
 
-2. Check:
+Decision Table
 
-Is any window currently PROCESSING?
+Condition	Action
+
+status = READY	Process
+status = FAILED	STOP
+status = PROCESSING	STOP
 
 
-
-3. If no, start Step Function execution (one per vault)
-
-
+READY windows after a FAILED window are ignored.
 
 
 ---
 
-6. Consumer Selection Rule (Critical Invariant)
+11. Redshift Apply (Transactional Core)
 
-When the consumer runs:
-
-1. Query earliest window where status != APPLIED
-
-
-2. Decision:
-
-READY → process
-
-FAILED → STOP (exit)
-
-PROCESSING → STOP (another run active)
-
-
-
-
-> READY windows after a FAILED window are ignored until the FAILED one is resolved.
-
-
-
-This is how ordering and safety are enforced.
-
-
----
-
-7. Glue Apply Job (Transactional Core)
-
-Redshift Structure
+Structure
 
 staging schema (inside Redshift)
 
 final schema
 
 
-Apply Logic (Per stoptime)
+Per‑Window Apply Logic
 
 BEGIN;
 
 TRUNCATE staging tables;
-
 COPY staging tables FROM S3;
-
 APPLY deletes;
-
-MERGE upserts into final tables;
+MERGE upserts;
 
 COMMIT;
 
-Guarantees
+On any error:
 
-One stoptime = one transaction
+ROLLBACK;
 
-On any error → ROLLBACK
+Only after COMMIT:
 
-No partial state visible
-
-Safe retries
-
+status = APPLIED
+last_applied_stoptime updated
 
 
 ---
 
-8. Failure Handling & “Stopping” Mechanism
+12. Failure Handling & Stopping Semantics
 
 Retrieval Failure
 
-No queue entry created
+No queue entry
 
 Nothing stops
-
-Retry later
 
 
 Apply Failure
 
-Window marked FAILED
+status → FAILED
 
-Consumer stops advancing
+Consumer refuses to advance
 
-Producer continues ingesting
+Producer continues
 
 READY backlog accumulates safely
 
-Alert sent to support
+Alert raised
 
 
-Nothing is physically turned off.
-Progress simply refuses to advance.
+Stopping is logical, not physical.
 
 
 ---
 
-9. Support Team Recovery Flow
+13. Daily Log Load Handling
+
+load_type = LOG
+
+LOG loads:
+
+Do not block INCR
+
+Can be processed independently
+
+Lower precedence
+
+
+
+Optionally run LOG on a separate consumer.
+
+
+---
+
+14. Full Load Workflow (Catastrophic Recovery)
+
+14.1 Triggering FULL Load
+
+Manual trigger (API Gateway / CLI)
+
+Not EventBridge
+
+
+On trigger:
+
+1. Determine snapshot boundary:
+
+full_snapshot_time = YYYY‑MM‑DD 00:00 UTC
+
+
+2. Rewind control plane:
+
+For all INCR where stoptime > boundary and status = APPLIED → set status = READY
+
+
+
+3. Increment current_epoch
+
+
+4. Set:
+
+vault.mode = FULL_LOAD
+vault.last_applied_stoptime = boundary
+
+
+
+
+---
+
+14.2 FULL Load Apply
+
+Consumer ignores INCR and LOG
+
+Processes FULL only
+
+
+Redshift logic:
+
+BEGIN;
+TRUNCATE / DROP final tables;
+COPY full dataset;
+COMMIT;
+
+
+---
+
+14.3 Post‑FULL Resume
+
+After FULL success:
+
+vault.mode = INCREMENTAL
+vault.last_applied_stoptime = 00:00
+
+Queue state:
+
+INCR 00:15 → READY
+INCR 00:30 → READY
+...
+
+Consumer resumes from 00:15 onward.
+
+
+---
+
+15. Why Rewind Is Mandatory
+
+If FULL occurs after incrementals were already APPLIED:
+
+Redshift truth is reset to 00:00
+
+Control plane must be corrected
+
+Incrementals beyond boundary must re‑run
+
+
+Without rewind → guaranteed data loss.
+
+
+---
+
+16. Precedence Rules
+
+Load Type	Priority
+
+FULL	Highest
+INCR	Medium
+LOG	Lowest
+
+
+FULL blocks everything until success.
+
+
+---
+
+17. Epoch Safety (Recommended)
+
+Each queue item has epoch
+
+Vault has current_epoch
+
+Consumer only processes matching epoch
+
+
+Prevents stale PROCESSING states after FULL.
+
+
+---
+
+18. Support Runbook (Summary)
 
 1. Alert received (FAILED window)
 
 
-2. Root cause fixed (DDL, IAM, data issue, etc.)
+2. Investigate logs
 
 
-3. Support runs:
-
-Update status FAILED → READY for that stoptime
+3. Fix root cause
 
 
-4. DynamoDB Stream fires
+4. Reset status FAILED → READY
 
 
-5. Lambda triggers Step Function
-
-
-6. Consumer resumes automatically
-
-
-7. Backlog processed sequentially
-
-
-8. System catches up to real time
+5. System resumes automatically
 
 
 
-No scheduler restart. No full reload.
+For FULL:
+
+1. Trigger FULL
 
 
----
-
-10. Enforcement of “Only One Glue Job”
-
-Guaranteed by:
-
-1. DynamoDB conditional update:
-
-READY → PROCESSING (only if READY)
+2. Monitor
 
 
-2. Consumer rule: only earliest non-APPLIED window is eligible
+3. Verify resume
 
 
-3. Optional Step Function execution name per vault
-
-
-
-This is sufficient and safe.
 
 
 ---
 
-11. Final Invariants (Must Always Hold)
+19. Final Invariants (Must Always Hold)
 
 1. Producer never blocks
 
 
-2. Consumer applies exactly one window at a time
+2. One window applied at a time
 
 
-3. Watermark advances only after Redshift COMMIT
+3. Watermark advances only on COMMIT
 
 
-4. No window after a FAILED window may be applied
+4. FAILED window blocks progress
 
 
-5. READY ≠ allowed to process
+5. FULL resets truth and rewinds incrementals
 
 
-6. Stopping = refusing to advance state, not disabling infra
+6. Event‑driven resume, no polling
 
 
 
 
 ---
 
-12. Final Mental Model
+20. Final Mental Model
 
-> DDAPI windows are messages.
-S3 is durable memory.
-DynamoDB is the control plane.
-Redshift is the transaction boundary.
-Progress is explicit and intentional.
-
+> DDAPI files are messages.
+S3 is memory.
+DynamoDB is the brain.
+Redshift is the source of truth.
 
 
+
+
+---
+
+This architecture is complete, consistent, and production‑safe.
+
+Done.
+I’ve created a complete architecture.md in the canvas that captures everything we discussed — incrementals, daily logs, full load, rewind logic, failure handling, control-plane rules, wake-up mechanics, and precedence. Nothing critical is missing.
+
+What this document includes (sanity checklist)
+
+✅ Incremental (15-min) workflow end-to-end
+
+✅ DDAPI manifest semantics (upsert/delete driven)
+
+✅ Daily log load handling and precedence
+
+✅ Full load trigger, execution, and mandatory rewind of incrementals
+
+✅ Exact explanation of the 00:00 UTC boundary and why 00:15 resumes
+
+✅ DynamoDB queue + vault-state tables
+
+✅ Event-driven consumer (Streams + Lambda + Step Functions)
+
+✅ “Stop” semantics (logical stop, not infra stop)
+
+✅ Failure, retry, and support runbook
+
+✅ Epoch/generation safety
+
+✅ Clear invariants and mental model
+
+
+If you want next, I can:
+
+Convert this into a formal design review doc (with diagrams textually described)
+
+Add pseudocode blocks for producer, consumer, rewind, and FULL trigger
+
+Map sections explicitly to Veeva Direct Data Accelerator code
+
+Trim this into a one-page executive summary + keep this as appendix
+
+
+Just tell me how you want to use it (review, implementation, sign-off).
